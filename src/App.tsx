@@ -360,7 +360,7 @@ function App() {
     setError("");
     try {
       await invoke("close_jushuitan_login_window");
-      setCookieStatus("登录窗口已强制关闭");
+      setCookieStatus("登录浏览器已关闭");
     } catch (err) {
       setError(String(err));
     } finally {
@@ -374,7 +374,7 @@ function App() {
     try {
       const message = await invoke<string>("reset_jushuitan_login_webview_profile");
       setCookieStatus(message || "登录浏览器缓存已重置");
-      setCookieDiagnostics("（已重置登录浏览器缓存，可重新打开登录窗口）");
+      setCookieDiagnostics("（已重置登录浏览器缓存，可重新打开登录浏览器）");
     } catch (err) {
       setError(String(err));
     } finally {
@@ -648,7 +648,7 @@ function App() {
                           disabled={!step1Ready || !step2Ready}
                         />
                         <Button onClick={openLoginWindow} disabled={!step1Ready || !step2Ready || running}>
-                          打开登录窗口
+                          打开登录浏览器
                         </Button>
                       </Space.Compact>
                     </Form.Item>
@@ -675,7 +675,7 @@ function App() {
                         onClick={closeLoginWindow}
                         disabled={cookieExtracting || cookieChecking || cookieResettingProfile || running}
                       >
-                        强制关闭登录窗口
+                        关闭登录浏览器
                       </Button>
                       <Button
                         loading={cookieResettingProfile}
@@ -707,12 +707,12 @@ function App() {
                       <Input.TextArea rows={4} value={settings.jstCookie} readOnly />
                     </Form.Item>
 
-                    <Form.Item label="登录窗口诊断日志（用于排查白屏）">
+                    <Form.Item label="登录浏览器诊断日志">
                       <Input.TextArea
                         rows={9}
                         value={cookieDiagnostics}
                         readOnly
-                        placeholder="点击“查看诊断日志”查看最近登录窗口事件日志；白屏时可先重置登录浏览器缓存后重试"
+                        placeholder="点击“查看诊断日志”查看外部浏览器登录与抓取 Cookie 事件"
                       />
                     </Form.Item>
                   </Form>

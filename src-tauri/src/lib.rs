@@ -1,8 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Context, Result};
 use calamine::{open_workbook_auto, Data, Reader};
@@ -14,8 +17,12 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_
 use reqwest::Url;
 use rust_xlsxwriter::Workbook;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{AppHandle, Manager};
 use walkdir::WalkDir;
+use tungstenite::{connect, Message};
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -142,6 +149,38 @@ struct OpenAiMessage {
     content: String,
 }
 
+#[derive(Debug)]
+struct ExternalLoginBrowserSession {
+    port: u16,
+    child: Child,
+}
+
+#[derive(Debug, Deserialize)]
+struct CdpVersionResponse {
+    #[serde(default, rename = "webSocketDebuggerUrl")]
+    web_socket_debugger_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CdpTargetResponse {
+    #[serde(default, rename = "type")]
+    target_type: String,
+    #[serde(default)]
+    url: String,
+    #[serde(default, rename = "webSocketDebuggerUrl")]
+    web_socket_debugger_url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CdpCookie {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    value: String,
+    #[serde(default)]
+    domain: String,
+}
+
 fn settings_path(app: &AppHandle) -> Result<PathBuf> {
     let dir = app
         .path()
@@ -157,15 +196,19 @@ fn login_log_path(app: &AppHandle) -> Result<PathBuf> {
     Ok(dir.join("jst-login.log"))
 }
 
-#[cfg(target_os = "windows")]
-fn login_webview_data_dir(app: &AppHandle) -> Result<PathBuf> {
+fn login_browser_profile_dir(app: &AppHandle) -> Result<PathBuf> {
     let dir = app
         .path()
         .app_data_dir()
         .context("无法获取应用数据目录")?
-        .join("jst-login-webview");
-    fs::create_dir_all(&dir).context("创建登录 WebView 数据目录失败")?;
+        .join("jst-login-external-browser");
+    fs::create_dir_all(&dir).context("创建登录浏览器数据目录失败")?;
     Ok(dir)
+}
+
+fn login_browser_session() -> &'static Mutex<Option<ExternalLoginBrowserSession>> {
+    static SESSION: OnceLock<Mutex<Option<ExternalLoginBrowserSession>>> = OnceLock::new();
+    SESSION.get_or_init(|| Mutex::new(None))
 }
 
 fn login_diag_buffer() -> &'static Mutex<VecDeque<String>> {
@@ -202,6 +245,257 @@ fn clear_diag_buffer() {
     if let Ok(mut guard) = login_diag_buffer().lock() {
         guard.clear();
     }
+}
+
+fn cdp_port_allocator() -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").context("分配 CDP 端口失败")?;
+    let port = listener
+        .local_addr()
+        .context("读取 CDP 端口失败")?
+        .port();
+    Ok(port)
+}
+
+fn browser_program_candidates() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    {
+        return vec![
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe".to_string(),
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe".to_string(),
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe".to_string(),
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe".to_string(),
+            "msedge.exe".to_string(),
+            "chrome.exe".to_string(),
+        ];
+    }
+    #[cfg(target_os = "macos")]
+    {
+        return vec![
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge".to_string(),
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".to_string(),
+            "microsoft-edge".to_string(),
+            "google-chrome".to_string(),
+            "chromium".to_string(),
+        ];
+    }
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        vec![
+            "microsoft-edge".to_string(),
+            "google-chrome".to_string(),
+            "chromium".to_string(),
+            "chromium-browser".to_string(),
+        ]
+    }
+}
+
+fn wait_cdp_ready(port: u16, timeout: Duration) -> Result<CdpVersionResponse> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .context("创建本地 CDP 客户端失败")?;
+    let deadline = Instant::now() + timeout;
+    let endpoint = format!("http://127.0.0.1:{port}/json/version");
+
+    loop {
+        if let Ok(resp) = client.get(&endpoint).send() {
+            if resp.status().is_success() {
+                let parsed = resp
+                    .json::<CdpVersionResponse>()
+                    .context("解析 CDP 版本信息失败")?;
+                return Ok(parsed);
+            }
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    Err(anyhow!("外部浏览器调试端口未就绪（port={port}）"))
+}
+
+fn spawn_external_login_browser(app: &AppHandle, login_url: &str) -> Result<ExternalLoginBrowserSession> {
+    let profile_dir = login_browser_profile_dir(app)?;
+    let port = cdp_port_allocator()?;
+    let mut launch_errors = Vec::<String>::new();
+
+    for program in browser_program_candidates() {
+        let mut cmd = Command::new(&program);
+        cmd.arg(format!("--remote-debugging-port={port}"))
+            .arg(format!("--user-data-dir={}", profile_dir.display()))
+            .arg("--no-first-run")
+            .arg("--no-default-browser-check")
+            .arg("--new-window")
+            .arg(login_url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+        #[cfg(target_os = "windows")]
+        {
+            // CREATE_NO_WINDOW
+            cmd.creation_flags(0x08000000);
+        }
+
+        match cmd.spawn() {
+            Ok(child) => {
+                append_login_log(
+                    app,
+                    &format!(
+                        "已启动外部登录浏览器: program={}, pid={}, port={}, profile={}",
+                        program,
+                        child.id(),
+                        port,
+                        profile_dir.display()
+                    ),
+                );
+                let _ = wait_cdp_ready(port, Duration::from_secs(10));
+                return Ok(ExternalLoginBrowserSession { port, child });
+            }
+            Err(err) => {
+                launch_errors.push(format!("{program}: {err}"));
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "无法启动外部浏览器，请确认安装 Edge/Chrome。尝试结果: {}",
+        launch_errors.join(" | ")
+    ))
+}
+
+fn cleanup_dead_session(app: &AppHandle, guard: &mut Option<ExternalLoginBrowserSession>) {
+    if let Some(session) = guard.as_mut() {
+        match session.child.try_wait() {
+            Ok(Some(status)) => {
+                append_login_log(
+                    app,
+                    &format!("检测到外部登录浏览器已退出，status={status}"),
+                );
+                *guard = None;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                append_login_log(&app, &format!("检测外部浏览器进程状态失败: {err}"));
+            }
+        }
+    }
+}
+
+fn close_external_browser_session(app: &AppHandle) -> Result<bool> {
+    let mut guard = login_browser_session()
+        .lock()
+        .map_err(|_| anyhow!("无法锁定浏览器会话状态"))?;
+    cleanup_dead_session(app, &mut guard);
+
+    let Some(mut session) = guard.take() else {
+        return Ok(false);
+    };
+
+    let pid = session.child.id();
+    let _ = session.child.kill();
+    let _ = session.child.wait();
+    append_login_log(app, &format!("外部登录浏览器已关闭，pid={pid}"));
+    Ok(true)
+}
+
+fn cdp_send_command(ws_url: &str, method: &str, params: Option<serde_json::Value>) -> Result<serde_json::Value> {
+    let (mut socket, _) = connect(ws_url).map_err(|e| anyhow!("连接 CDP 失败: {}", e))?;
+    if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_mut() {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(8)));
+        let _ = stream.set_write_timeout(Some(Duration::from_secs(8)));
+    }
+    let payload = match params {
+        Some(p) => serde_json::json!({
+            "id": 1,
+            "method": method,
+            "params": p,
+        }),
+        None => serde_json::json!({
+            "id": 1,
+            "method": method,
+        }),
+    };
+    socket
+        .send(Message::Text(payload.to_string().into()))
+        .map_err(|e| anyhow!("发送 CDP 命令失败: {}", e))?;
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if Instant::now() > deadline {
+            return Err(anyhow!("等待 CDP 响应超时"));
+        }
+        let msg = socket.read().map_err(|e| anyhow!("读取 CDP 响应失败: {}", e))?;
+        if let Message::Text(text) = msg {
+            let value: serde_json::Value =
+                serde_json::from_str(&text).map_err(|e| anyhow!("解析 CDP 响应失败: {}", e))?;
+            if value.get("id").and_then(|v| v.as_i64()) == Some(1) {
+                if let Some(err) = value.get("error") {
+                    return Err(anyhow!("CDP 返回错误: {}", err));
+                }
+                return Ok(value);
+            }
+        }
+    }
+}
+
+fn open_url_with_cdp(port: u16, url: &str) -> Result<()> {
+    let version = wait_cdp_ready(port, Duration::from_secs(4))?;
+    let ws_url = version
+        .web_socket_debugger_url
+        .ok_or_else(|| anyhow!("CDP 版本信息缺少 webSocketDebuggerUrl"))?;
+    let _ = cdp_send_command(
+        &ws_url,
+        "Target.createTarget",
+        Some(serde_json::json!({ "url": url })),
+    )?;
+    Ok(())
+}
+
+fn collect_cookies_from_cdp(app: &AppHandle, port: u16) -> Result<Vec<CdpCookie>> {
+    let client = Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+        .context("创建本地 CDP 客户端失败")?;
+    let targets_url = format!("http://127.0.0.1:{port}/json/list");
+    let targets = client
+        .get(&targets_url)
+        .send()
+        .context("请求 CDP target 列表失败")?
+        .json::<Vec<CdpTargetResponse>>()
+        .context("解析 CDP target 列表失败")?;
+
+    let mut ws_urls = targets
+        .iter()
+        .filter(|t| t.target_type == "page")
+        .filter_map(|t| t.web_socket_debugger_url.clone().map(|ws| (t.url.clone(), ws)))
+        .collect::<Vec<(String, String)>>();
+
+    ws_urls.sort_by_key(|(url, _)| if url.contains("erp321.com") { 0 } else { 1 });
+
+    for (url, ws_url) in ws_urls {
+        let res = cdp_send_command(&ws_url, "Network.getAllCookies", None);
+        match res {
+            Ok(value) => {
+                let cookies = value
+                    .pointer("/result/cookies")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::Value::Array(Vec::new()));
+                let parsed = serde_json::from_value::<Vec<CdpCookie>>(cookies)
+                    .context("解析 CDP cookies 失败")?;
+                append_login_log(
+                    app,
+                    &format!("从 target 提取 cookies: url={}, count={}", url, parsed.len()),
+                );
+                if !parsed.is_empty() {
+                    return Ok(parsed);
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+
+    Err(anyhow!("未从外部浏览器调试会话中读取到 Cookie"))
 }
 
 fn append_login_log(app: &AppHandle, message: &str) {
@@ -985,144 +1279,71 @@ fn open_jushuitan_login_window(app: AppHandle, login_url: Option<String>) -> Res
     }
 
     let parsed = Url::parse(&url).map_err(|e| format!("登录 URL 格式错误: {}", e))?;
-    let label = "jst-login";
-    append_login_log(&app, &format!("请求打开登录窗口，URL={}", parsed));
+    append_login_log(&app, &format!("请求打开外部登录浏览器，URL={}", parsed));
+    let existing_session = {
+        let mut guard = login_browser_session()
+            .lock()
+            .map_err(|_| "无法锁定浏览器会话状态".to_string())?;
+        cleanup_dead_session(&app, &mut guard);
+        guard
+            .as_ref()
+            .map(|s| (s.port, s.child.id()))
+    };
 
-    if let Some(window) = app.get_webview_window(label) {
-        append_login_log(&app, "登录窗口已存在，尝试复用并跳转");
-        window
-            .navigate(parsed)
-            .map_err(|e| format!("跳转登录页失败: {}", e))?;
-        window.show().map_err(|e| format!("显示登录窗口失败: {}", e))?;
-        window
-            .set_focus()
-            .map_err(|e| format!("聚焦登录窗口失败: {}", e))?;
-        append_login_log(&app, "复用窗口成功");
-        return Ok(());
+    if let Some((port, pid)) = existing_session {
+        if let Err(err) = open_url_with_cdp(port, parsed.as_str()) {
+            append_login_log(&app, &format!("复用已有浏览器失败，将重启: {err}"));
+            let _ = close_external_browser_session(&app);
+        } else {
+            append_login_log(
+                &app,
+                &format!("已复用外部浏览器会话，pid={}, port={}", pid, port),
+            );
+            return Ok(());
+        }
     }
 
-    let nav_log_app = app.clone();
-    let load_log_app = app.clone();
-
-    #[cfg(target_os = "windows")]
-    let login_data_dir = login_webview_data_dir(&app).map_err(|e| e.to_string())?;
-    #[cfg(target_os = "windows")]
+    let session = spawn_external_login_browser(&app, parsed.as_str()).map_err(|e| e.to_string())?;
     append_login_log(
         &app,
-        &format!("Windows 登录窗口数据目录: {}", login_data_dir.display()),
+        &format!("外部登录浏览器已启动，pid={}, port={}", session.child.id(), session.port),
     );
-
-    #[cfg(target_os = "windows")]
-    let builder = WebviewWindowBuilder::new(&app, label, WebviewUrl::External(parsed))
-        .title("聚水潭登录")
-        .inner_size(1280.0, 860.0)
-        .resizable(true)
-        .data_directory(login_data_dir)
-        .on_navigation(move |url| {
-            append_login_log(&nav_log_app, &format!("on_navigation: {}", url));
-            true
-        })
-        .on_page_load(move |_, payload| {
-            append_login_log(
-                &load_log_app,
-                &format!(
-                    "on_page_load: event={:?}, url={}",
-                    payload.event(),
-                    payload.url()
-                ),
-            );
-        })
-        // 某些站点在 Windows WebView2 上会因为 UA 识别导致白屏，显式伪装为桌面 Chrome。
-        .user_agent(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
-        );
-
-    #[cfg(not(target_os = "windows"))]
-    let builder = WebviewWindowBuilder::new(&app, label, WebviewUrl::External(parsed))
-        .title("聚水潭登录")
-        .inner_size(1280.0, 860.0)
-        .resizable(true)
-        .on_navigation(move |url| {
-            append_login_log(&nav_log_app, &format!("on_navigation: {}", url));
-            true
-        })
-        .on_page_load(move |_, payload| {
-            append_login_log(
-                &load_log_app,
-                &format!(
-                    "on_page_load: event={:?}, url={}",
-                    payload.event(),
-                    payload.url()
-                ),
-            );
-        });
-
-    builder
-        .build()
-        .map_err(|e| format!("创建登录窗口失败: {}", e))?;
-    append_login_log(&app, "创建登录窗口成功");
-
+    let mut guard = login_browser_session()
+        .lock()
+        .map_err(|_| "无法锁定浏览器会话状态".to_string())?;
+    *guard = Some(session);
     Ok(())
 }
 
 #[tauri::command]
 fn capture_jushuitan_cookie(app: AppHandle) -> Result<String, String> {
-    append_login_log(&app, "开始提取 Cookie");
-    let window = app
-        .get_webview_window("jst-login")
-        .ok_or_else(|| "未找到登录窗口，请先点击“打开登录窗口”并完成登录".to_string())?;
+    append_login_log(&app, "开始从外部登录浏览器提取 Cookie");
+    let port = {
+        let mut guard = login_browser_session()
+            .lock()
+            .map_err(|_| "无法锁定浏览器会话状态".to_string())?;
+        cleanup_dead_session(&app, &mut guard);
+        let Some(session) = guard.as_ref() else {
+            return Err("未找到登录浏览器会话，请先点击“打开登录浏览器”并完成登录".to_string());
+        };
+        session.port
+    };
 
-    let mut all_cookies = window
-        .cookies()
-        .map_err(|e| format!("读取登录窗口 Cookie 失败: {}", e))?;
-
-    // 仅保留聚水潭相关域名 Cookie，避免把无关站点 Cookie 混入请求头。
-    all_cookies.retain(|cookie| {
-        cookie
-            .domain()
-            .map(|domain| domain.contains("erp321.com"))
-            .unwrap_or(false)
-    });
+    let cookies = collect_cookies_from_cdp(&app, port).map_err(|e| e.to_string())?;
+    let mut cookie_map = HashMap::<String, String>::new();
+    for cookie in cookies {
+        if cookie.domain.contains("erp321.com") {
+            cookie_map.insert(cookie.name, cookie.value);
+        }
+    }
     append_login_log(
         &app,
-        &format!("窗口 Cookie 初次读取数量（过滤后）={}", all_cookies.len()),
+        &format!("外部浏览器 Cookie 数量（过滤后）={}", cookie_map.len()),
     );
-
-    if all_cookies.is_empty() {
-        let urls = [
-            "https://www.erp321.com/",
-            "https://src.erp321.com/",
-            "https://apiweb.erp321.com/",
-            "https://ss.erp321.com/",
-            "https://api.erp321.com/",
-        ];
-        for raw_url in urls {
-            if let Ok(parsed) = Url::parse(raw_url) {
-                if let Ok(mut cookies) = window.cookies_for_url(parsed) {
-                    all_cookies.append(&mut cookies);
-                }
-            }
-        }
-        all_cookies.retain(|cookie| {
-            cookie
-                .domain()
-                .map(|domain| domain.contains("erp321.com"))
-                .unwrap_or(false)
-        });
-        append_login_log(
-            &app,
-            &format!("按域名补充后 Cookie 数量（过滤后）={}", all_cookies.len()),
-        );
+    if cookie_map.is_empty() {
+        return Err("未提取到聚水潭 Cookie，请确认已在外部浏览器完成登录并停留在 erp321.com 域页面".to_string());
     }
 
-    if all_cookies.is_empty() {
-        return Err("未提取到聚水潭 Cookie，请确认已在登录窗口完成登录".to_string());
-    }
-
-    let mut cookie_map = HashMap::<String, String>::new();
-    for cookie in all_cookies {
-        cookie_map.insert(cookie.name().to_string(), cookie.value().to_string());
-    }
     let mut pairs = cookie_map.into_iter().collect::<Vec<(String, String)>>();
     pairs.sort_by(|a, b| a.0.cmp(&b.0));
     let cookie_header = pairs
@@ -1144,75 +1365,63 @@ fn capture_jushuitan_cookie(app: AppHandle) -> Result<String, String> {
 
 #[tauri::command]
 fn close_jushuitan_login_window(app: AppHandle) -> Result<(), String> {
-    append_login_log(&app, "收到关闭登录窗口请求");
-    let Some(window) = app.get_webview_window("jst-login") else {
-        append_login_log(&app, "关闭请求结束：未找到登录窗口");
-        return Ok(());
-    };
-    window
-        .destroy()
-        .map_err(|e| format!("强制关闭登录窗口失败: {}", e))?;
-    append_login_log(&app, "登录窗口已强制关闭");
+    append_login_log(&app, "收到关闭登录浏览器请求");
+    let closed = close_external_browser_session(&app).map_err(|e| e.to_string())?;
+    if !closed {
+        append_login_log(&app, "关闭请求结束：未找到外部登录浏览器会话");
+    }
     Ok(())
 }
 
 #[tauri::command]
 fn reset_jushuitan_login_webview_profile(app: AppHandle) -> Result<String, String> {
-    append_login_log(&app, "收到重置登录 WebView 数据目录请求");
+    append_login_log(&app, "收到重置外部登录浏览器数据目录请求");
+    let _ = close_external_browser_session(&app);
+    let data_dir = login_browser_profile_dir(&app).map_err(|e| e.to_string())?;
 
-    if let Some(window) = app.get_webview_window("jst-login") {
-        let _ = window.destroy();
-        append_login_log(&app, "重置前已强制关闭登录窗口");
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let base_dir = app
-            .path()
-            .app_data_dir()
-            .map_err(|e| format!("获取应用数据目录失败: {}", e))?;
-        let data_dir = base_dir.join("jst-login-webview");
-
-        for attempt in 1..=3 {
-            if !data_dir.exists() {
-                break;
-            }
-            match fs::remove_dir_all(&data_dir) {
-                Ok(_) => break,
-                Err(err) if attempt < 3 => {
-                    append_login_log(
-                        &app,
-                        &format!("删除数据目录失败(第{attempt}次)，稍后重试: {}", err),
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                }
-                Err(err) => return Err(format!("删除数据目录失败: {}", err)),
-            }
+    for attempt in 1..=3 {
+        if !data_dir.exists() {
+            break;
         }
-
-        fs::create_dir_all(&data_dir).map_err(|e| format!("重建数据目录失败: {}", e))?;
-        append_login_log(
-            &app,
-            &format!("重置完成，目录: {}", data_dir.display()),
-        );
-        return Ok(format!(
-            "登录浏览器缓存已重置：{}",
-            data_dir.to_string_lossy()
-        ));
+        match fs::remove_dir_all(&data_dir) {
+            Ok(_) => break,
+            Err(err) if attempt < 3 => {
+                append_login_log(
+                    &app,
+                    &format!("删除外部浏览器数据目录失败(第{attempt}次)，稍后重试: {}", err),
+                );
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(err) => return Err(format!("删除外部浏览器数据目录失败: {}", err)),
+        }
     }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        append_login_log(&app, "当前平台无需重置 WebView2 数据目录");
-        Ok("当前平台无需重置登录浏览器缓存".to_string())
-    }
+    fs::create_dir_all(&data_dir).map_err(|e| format!("重建外部浏览器数据目录失败: {}", e))?;
+    append_login_log(
+        &app,
+        &format!("外部登录浏览器数据目录重置完成: {}", data_dir.display()),
+    );
+    Ok(format!(
+        "登录浏览器缓存已重置：{}",
+        data_dir.to_string_lossy()
+    ))
 }
 
 #[tauri::command]
-fn get_jushuitan_login_diagnostics() -> Result<String, String> {
-    // 仅走内存日志，避免触发任何可能在异常 WebView 状态下阻塞的调用。
+fn get_jushuitan_login_diagnostics(app: AppHandle) -> Result<String, String> {
+    let session_text = if let Ok(mut guard) = login_browser_session().lock() {
+        cleanup_dead_session(&app, &mut guard);
+        if let Some(session) = guard.as_ref() {
+            format!("外部浏览器会话: 运行中 (pid={}, port={})", session.child.id(), session.port)
+        } else {
+            "外部浏览器会话: 未运行".to_string()
+        }
+    } else {
+        "外部浏览器会话: 状态读取失败".to_string()
+    };
+
     Ok(format!(
-        "诊断来源: 内存环形缓冲区\n\n===== 最近日志(最多200行) =====\n{}",
+        "诊断来源: 内存环形缓冲区\n{}\n\n===== 最近日志(最多200行) =====\n{}",
+        session_text,
         read_diag_tail(200)
     ))
 }
