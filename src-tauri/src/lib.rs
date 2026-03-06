@@ -901,7 +901,7 @@ fn save_settings(app: AppHandle, settings: AppSettings) -> Result<(), String> {
 #[tauri::command]
 fn open_jushuitan_login_window(app: AppHandle, login_url: Option<String>) -> Result<(), String> {
     let url = login_url
-        .unwrap_or_else(|| "https://www.erp321.com/".to_string())
+        .unwrap_or_else(|| "https://www.erp321.com/app/order/order/list.aspx?_c=jst-epaas".to_string())
         .trim()
         .to_string();
     if url.is_empty() {
@@ -922,10 +922,23 @@ fn open_jushuitan_login_window(app: AppHandle, login_url: Option<String>) -> Res
         return Ok(());
     }
 
-    WebviewWindowBuilder::new(&app, label, WebviewUrl::External(parsed))
+    #[cfg(target_os = "windows")]
+    let builder = WebviewWindowBuilder::new(&app, label, WebviewUrl::External(parsed))
         .title("聚水潭登录")
         .inner_size(1280.0, 860.0)
         .resizable(true)
+        // 某些站点在 Windows WebView2 上会因为 UA 识别导致白屏，显式伪装为桌面 Chrome。
+        .user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+        );
+
+    #[cfg(not(target_os = "windows"))]
+    let builder = WebviewWindowBuilder::new(&app, label, WebviewUrl::External(parsed))
+        .title("聚水潭登录")
+        .inner_size(1280.0, 860.0)
+        .resizable(true);
+
+    builder
         .build()
         .map_err(|e| format!("创建登录窗口失败: {}", e))?;
 
