@@ -1,7 +1,8 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{anyhow, Context, Result};
 use calamine::{open_workbook_auto, Data, Reader};
@@ -156,16 +157,65 @@ fn login_log_path(app: &AppHandle) -> Result<PathBuf> {
     Ok(dir.join("jst-login.log"))
 }
 
+#[cfg(target_os = "windows")]
+fn login_webview_data_dir(app: &AppHandle) -> Result<PathBuf> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .context("无法获取应用数据目录")?
+        .join("jst-login-webview");
+    fs::create_dir_all(&dir).context("创建登录 WebView 数据目录失败")?;
+    Ok(dir)
+}
+
+fn login_diag_buffer() -> &'static Mutex<VecDeque<String>> {
+    static BUF: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
+    BUF.get_or_init(|| Mutex::new(VecDeque::with_capacity(512)))
+}
+
+fn push_diag_line(line: String) {
+    if let Ok(mut guard) = login_diag_buffer().lock() {
+        if guard.len() >= 500 {
+            guard.pop_front();
+        }
+        guard.push_back(line);
+    }
+}
+
+fn read_diag_tail(max_lines: usize) -> String {
+    if let Ok(guard) = login_diag_buffer().lock() {
+        if guard.is_empty() {
+            return "（暂无日志）".to_string();
+        }
+        let start = guard.len().saturating_sub(max_lines);
+        return guard
+            .iter()
+            .skip(start)
+            .cloned()
+            .collect::<Vec<String>>()
+            .join("\n");
+    }
+    "（诊断缓冲区不可用）".to_string()
+}
+
+fn clear_diag_buffer() {
+    if let Ok(mut guard) = login_diag_buffer().lock() {
+        guard.clear();
+    }
+}
+
 fn append_login_log(app: &AppHandle, message: &str) {
-    let path = match login_log_path(app) {
-        Ok(path) => path,
-        Err(_) => return,
-    };
     let line = format!(
         "[{}] {}\n",
         Local::now().format("%Y-%m-%d %H:%M:%S"),
         message
     );
+    push_diag_line(line.trim_end().to_string());
+
+    let path = match login_log_path(app) {
+        Ok(path) => path,
+        Err(_) => return,
+    };
     if let Ok(mut file) = fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -173,15 +223,6 @@ fn append_login_log(app: &AppHandle, message: &str) {
     {
         let _ = file.write_all(line.as_bytes());
     }
-}
-
-fn tail_lines(content: &str, max_lines: usize) -> String {
-    let lines = content.lines().collect::<Vec<&str>>();
-    if lines.len() <= max_lines {
-        return content.to_string();
-    }
-    let start = lines.len().saturating_sub(max_lines);
-    lines[start..].join("\n")
 }
 
 fn normalize_text(input: &str) -> String {
@@ -964,10 +1005,19 @@ fn open_jushuitan_login_window(app: AppHandle, login_url: Option<String>) -> Res
     let load_log_app = app.clone();
 
     #[cfg(target_os = "windows")]
+    let login_data_dir = login_webview_data_dir(&app).map_err(|e| e.to_string())?;
+    #[cfg(target_os = "windows")]
+    append_login_log(
+        &app,
+        &format!("Windows 登录窗口数据目录: {}", login_data_dir.display()),
+    );
+
+    #[cfg(target_os = "windows")]
     let builder = WebviewWindowBuilder::new(&app, label, WebviewUrl::External(parsed))
         .title("聚水潭登录")
         .inner_size(1280.0, 860.0)
         .resizable(true)
+        .data_directory(login_data_dir)
         .on_navigation(move |url| {
             append_login_log(&nav_log_app, &format!("on_navigation: {}", url));
             true
@@ -1107,32 +1157,69 @@ fn close_jushuitan_login_window(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn get_jushuitan_login_diagnostics(app: AppHandle) -> Result<String, String> {
-    // 注意：某些异常环境下，查询 WebView 运行时/窗口状态可能阻塞，导致前端一直转圈。
-    // 这里保持诊断函数“快速、稳定可返回”，只输出不易阻塞的信息。
-    let exists = app.get_webview_window("jst-login").is_some();
+fn reset_jushuitan_login_webview_profile(app: AppHandle) -> Result<String, String> {
+    append_login_log(&app, "收到重置登录 WebView 数据目录请求");
 
-    let log_path = login_log_path(&app).map_err(|e| e.to_string())?;
-    let log_raw = fs::read_to_string(&log_path).unwrap_or_default();
-    let log_tail = tail_lines(&log_raw, 200);
+    if let Some(window) = app.get_webview_window("jst-login") {
+        let _ = window.destroy();
+        append_login_log(&app, "重置前已强制关闭登录窗口");
+    }
 
-    let report = format!(
-        "登录窗口存在: {exists}\n日志文件: {}\n\n===== 最近日志(最多200行) =====\n{}",
-        log_path.display(),
-        if log_tail.trim().is_empty() {
-            "（暂无日志）".to_string()
-        } else {
-            log_tail
+    #[cfg(target_os = "windows")]
+    {
+        let base_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("获取应用数据目录失败: {}", e))?;
+        let data_dir = base_dir.join("jst-login-webview");
+
+        for attempt in 1..=3 {
+            if !data_dir.exists() {
+                break;
+            }
+            match fs::remove_dir_all(&data_dir) {
+                Ok(_) => break,
+                Err(err) if attempt < 3 => {
+                    append_login_log(
+                        &app,
+                        &format!("删除数据目录失败(第{attempt}次)，稍后重试: {}", err),
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+                Err(err) => return Err(format!("删除数据目录失败: {}", err)),
+            }
         }
-    );
-    Ok(report)
+
+        fs::create_dir_all(&data_dir).map_err(|e| format!("重建数据目录失败: {}", e))?;
+        append_login_log(
+            &app,
+            &format!("重置完成，目录: {}", data_dir.display()),
+        );
+        return Ok(format!(
+            "登录浏览器缓存已重置：{}",
+            data_dir.to_string_lossy()
+        ));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        append_login_log(&app, "当前平台无需重置 WebView2 数据目录");
+        Ok("当前平台无需重置登录浏览器缓存".to_string())
+    }
 }
 
 #[tauri::command]
-fn clear_jushuitan_login_diagnostics(app: AppHandle) -> Result<(), String> {
-    let path = login_log_path(&app).map_err(|e| e.to_string())?;
-    fs::write(&path, "").map_err(|e| format!("清空日志失败: {}", e))?;
-    append_login_log(&app, "日志已清空");
+fn get_jushuitan_login_diagnostics() -> Result<String, String> {
+    // 仅走内存日志，避免触发任何可能在异常 WebView 状态下阻塞的调用。
+    Ok(format!(
+        "诊断来源: 内存环形缓冲区\n\n===== 最近日志(最多200行) =====\n{}",
+        read_diag_tail(200)
+    ))
+}
+
+#[tauri::command]
+fn clear_jushuitan_login_diagnostics() -> Result<(), String> {
+    clear_diag_buffer();
     Ok(())
 }
 
@@ -1207,6 +1294,7 @@ pub fn run() {
             save_settings,
             open_jushuitan_login_window,
             close_jushuitan_login_window,
+            reset_jushuitan_login_webview_profile,
             capture_jushuitan_cookie,
             get_jushuitan_login_diagnostics,
             clear_jushuitan_login_diagnostics,

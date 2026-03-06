@@ -131,6 +131,7 @@ function App() {
   const [cookieChecking, setCookieChecking] = useState(false);
   const [cookieExtracting, setCookieExtracting] = useState(false);
   const [cookieClosingWindow, setCookieClosingWindow] = useState(false);
+  const [cookieResettingProfile, setCookieResettingProfile] = useState(false);
   const [cookieDiagLoading, setCookieDiagLoading] = useState(false);
   const [cookieDiagnostics, setCookieDiagnostics] = useState("");
 
@@ -364,6 +365,20 @@ function App() {
       setError(String(err));
     } finally {
       setCookieClosingWindow(false);
+    }
+  };
+
+  const resetLoginProfile = async () => {
+    setCookieResettingProfile(true);
+    setError("");
+    try {
+      const message = await invoke<string>("reset_jushuitan_login_webview_profile");
+      setCookieStatus(message || "登录浏览器缓存已重置");
+      setCookieDiagnostics("（已重置登录浏览器缓存，可重新打开登录窗口）");
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setCookieResettingProfile(false);
     }
   };
 
@@ -658,21 +673,28 @@ function App() {
                         danger
                         loading={cookieClosingWindow}
                         onClick={closeLoginWindow}
-                        disabled={cookieExtracting || cookieChecking || running}
+                        disabled={cookieExtracting || cookieChecking || cookieResettingProfile || running}
                       >
                         强制关闭登录窗口
                       </Button>
                       <Button
+                        loading={cookieResettingProfile}
+                        onClick={resetLoginProfile}
+                        disabled={cookieExtracting || cookieChecking || cookieClosingWindow || running}
+                      >
+                        重置登录浏览器缓存
+                      </Button>
+                      <Button
                         loading={cookieDiagLoading}
                         onClick={loadCookieDiagnostics}
-                        disabled={running}
+                        disabled={cookieResettingProfile || running}
                       >
                         查看诊断日志
                       </Button>
                       <Button
                         loading={cookieDiagLoading}
                         onClick={clearCookieDiagnostics}
-                        disabled={running}
+                        disabled={cookieResettingProfile || running}
                       >
                         清空诊断日志
                       </Button>
@@ -690,7 +712,7 @@ function App() {
                         rows={9}
                         value={cookieDiagnostics}
                         readOnly
-                        placeholder="点击“查看诊断日志”后显示 WebView2 版本、窗口状态和最近页面加载日志"
+                        placeholder="点击“查看诊断日志”查看最近登录窗口事件日志；白屏时可先重置登录浏览器缓存后重试"
                       />
                     </Form.Item>
                   </Form>
