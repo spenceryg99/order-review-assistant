@@ -1,0 +1,49 @@
+.app-page {
+  min-height: 100vh;
+  padding: 12px;
+  background: linear-gradient(180deg, #f2f6fb 0%, #ebf1f7 100%);
+}
+
+.app-shell {
+  max-width: 1360px;
+  margin: 0 auto;
+}
+
+.top-card {
+  border-radius: 16px;
+  box-shadow: 0 12px 28px rgba(12, 41, 64, 0.08);
+}
+
+.step-nav {
+  margin-top: 16px;
+}
+
+.step-content {
+  margin-top: 14px;
+}
+
+.content-card {
+  border-radius: 14px;
+  box-shadow: 0 8px 20px rgba(12, 41, 64, 0.06);
+}
+
+.inner-card {
+  border-radius: 10px;
+  background: #fafcff;
+}
+
+.grid-two {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+@media (max-width: 900px) {
+  .app-page {
+    padding: 10px;
+  }
+
+  .grid-two {
+    grid-template-columns: 1fr;
+  }
+}
