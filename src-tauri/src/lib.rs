@@ -152,7 +152,7 @@ struct OpenAiMessage {
 #[derive(Debug)]
 struct ExternalLoginBrowserSession {
     port: u16,
-    child: Child,
+    child: Option<Child>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -314,6 +314,10 @@ fn wait_cdp_ready(port: u16, timeout: Duration) -> Result<CdpVersionResponse> {
     Err(anyhow!("外部浏览器调试端口未就绪（port={port}）"))
 }
 
+fn is_cdp_alive(port: u16) -> bool {
+    wait_cdp_ready(port, Duration::from_millis(800)).is_ok()
+}
+
 fn spawn_external_login_browser(app: &AppHandle, login_url: &str) -> Result<ExternalLoginBrowserSession> {
     let profile_dir = login_browser_profile_dir(app)?;
     let port = cdp_port_allocator()?;
@@ -338,7 +342,7 @@ fn spawn_external_login_browser(app: &AppHandle, login_url: &str) -> Result<Exte
         }
 
         match cmd.spawn() {
-            Ok(child) => {
+            Ok(mut child) => {
                 append_login_log(
                     app,
                     &format!(
@@ -349,8 +353,24 @@ fn spawn_external_login_browser(app: &AppHandle, login_url: &str) -> Result<Exte
                         profile_dir.display()
                     ),
                 );
-                let _ = wait_cdp_ready(port, Duration::from_secs(10));
-                return Ok(ExternalLoginBrowserSession { port, child });
+                match wait_cdp_ready(port, Duration::from_secs(20)) {
+                    Ok(_) => {
+                        append_login_log(app, &format!("CDP 端口已就绪: {port}"));
+                        return Ok(ExternalLoginBrowserSession {
+                            port,
+                            child: Some(child),
+                        });
+                    }
+                    Err(err) => {
+                        append_login_log(
+                            app,
+                            &format!("该浏览器实例 CDP 未就绪，忽略并继续尝试: {}", err),
+                        );
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        launch_errors.push(format!("{program}: {err}"));
+                    }
+                }
             }
             Err(err) => {
                 launch_errors.push(format!("{program}: {err}"));
@@ -366,20 +386,39 @@ fn spawn_external_login_browser(app: &AppHandle, login_url: &str) -> Result<Exte
 
 fn cleanup_dead_session(app: &AppHandle, guard: &mut Option<ExternalLoginBrowserSession>) {
     if let Some(session) = guard.as_mut() {
-        match session.child.try_wait() {
-            Ok(Some(status)) => {
-                append_login_log(
-                    app,
-                    &format!("检测到外部登录浏览器已退出，status={status}"),
-                );
-                *guard = None;
-            }
-            Ok(None) => {}
-            Err(err) => {
-                append_login_log(&app, &format!("检测外部浏览器进程状态失败: {err}"));
+        if let Some(child) = session.child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    append_login_log(
+                        app,
+                        &format!("检测到外部登录浏览器启动进程已退出，status={status}"),
+                    );
+                    session.child = None;
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    append_login_log(app, &format!("检测外部浏览器进程状态失败: {err}"));
+                }
             }
         }
+
+        if !is_cdp_alive(session.port) {
+            append_login_log(
+                app,
+                &format!("检测到 CDP 端口不可用，清理会话: port={}", session.port),
+            );
+            *guard = None;
+        }
     }
+}
+
+fn close_external_browser_via_cdp(port: u16) -> Result<()> {
+    let version = wait_cdp_ready(port, Duration::from_secs(2))?;
+    let ws_url = version
+        .web_socket_debugger_url
+        .ok_or_else(|| anyhow!("CDP 版本信息缺少 webSocketDebuggerUrl"))?;
+    let _ = cdp_send_command(&ws_url, "Browser.close", None)?;
+    Ok(())
 }
 
 fn close_external_browser_session(app: &AppHandle) -> Result<bool> {
@@ -392,10 +431,18 @@ fn close_external_browser_session(app: &AppHandle) -> Result<bool> {
         return Ok(false);
     };
 
-    let pid = session.child.id();
-    let _ = session.child.kill();
-    let _ = session.child.wait();
-    append_login_log(app, &format!("外部登录浏览器已关闭，pid={pid}"));
+    let _ = close_external_browser_via_cdp(session.port);
+    if let Some(child) = session.child.as_mut() {
+        let pid = child.id();
+        let _ = child.kill();
+        let _ = child.wait();
+        append_login_log(app, &format!("外部登录浏览器进程已关闭，pid={pid}"));
+    } else {
+        append_login_log(
+            app,
+            &format!("外部登录浏览器会话已关闭（通过 CDP），port={}", session.port),
+        );
+    }
     Ok(true)
 }
 
@@ -1287,7 +1334,7 @@ fn open_jushuitan_login_window(app: AppHandle, login_url: Option<String>) -> Res
         cleanup_dead_session(&app, &mut guard);
         guard
             .as_ref()
-            .map(|s| (s.port, s.child.id()))
+            .map(|s| (s.port, s.child.as_ref().map(|c| c.id())))
     };
 
     if let Some((port, pid)) = existing_session {
@@ -1297,7 +1344,11 @@ fn open_jushuitan_login_window(app: AppHandle, login_url: Option<String>) -> Res
         } else {
             append_login_log(
                 &app,
-                &format!("已复用外部浏览器会话，pid={}, port={}", pid, port),
+                &format!(
+                    "已复用外部浏览器会话，pid={}, port={}",
+                    pid.map(|v| v.to_string()).unwrap_or_else(|| "unknown".to_string()),
+                    port
+                ),
             );
             return Ok(());
         }
@@ -1306,7 +1357,15 @@ fn open_jushuitan_login_window(app: AppHandle, login_url: Option<String>) -> Res
     let session = spawn_external_login_browser(&app, parsed.as_str()).map_err(|e| e.to_string())?;
     append_login_log(
         &app,
-        &format!("外部登录浏览器已启动，pid={}, port={}", session.child.id(), session.port),
+        &format!(
+            "外部登录浏览器已启动，pid={}, port={}",
+            session
+                .child
+                .as_ref()
+                .map(|c| c.id().to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            session.port
+        ),
     );
     let mut guard = login_browser_session()
         .lock()
@@ -1411,7 +1470,17 @@ fn get_jushuitan_login_diagnostics(app: AppHandle) -> Result<String, String> {
     let session_text = if let Ok(mut guard) = login_browser_session().lock() {
         cleanup_dead_session(&app, &mut guard);
         if let Some(session) = guard.as_ref() {
-            format!("外部浏览器会话: 运行中 (pid={}, port={})", session.child.id(), session.port)
+            let pid_text = session
+                .child
+                .as_ref()
+                .map(|c| c.id().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            format!(
+                "外部浏览器会话: 运行中 (pid={}, port={}, cdp_alive={})",
+                pid_text,
+                session.port,
+                if is_cdp_alive(session.port) { "yes" } else { "no" }
+            )
         } else {
             "外部浏览器会话: 未运行".to_string()
         }
