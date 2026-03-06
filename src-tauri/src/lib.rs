@@ -1108,24 +1108,16 @@ fn close_jushuitan_login_window(app: AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 fn get_jushuitan_login_diagnostics(app: AppHandle) -> Result<String, String> {
-    let webview_version = match tauri::webview_version() {
-        Ok(v) => format!("WebView Runtime: {}", v),
-        Err(e) => format!("WebView Runtime: unavailable ({})", e),
-    };
-
-    let (exists, visible) = if let Some(window) = app.get_webview_window("jst-login") {
-        let visible = window.is_visible().unwrap_or(false);
-        (true, visible)
-    } else {
-        (false, false)
-    };
+    // 注意：某些异常环境下，查询 WebView 运行时/窗口状态可能阻塞，导致前端一直转圈。
+    // 这里保持诊断函数“快速、稳定可返回”，只输出不易阻塞的信息。
+    let exists = app.get_webview_window("jst-login").is_some();
 
     let log_path = login_log_path(&app).map_err(|e| e.to_string())?;
     let log_raw = fs::read_to_string(&log_path).unwrap_or_default();
     let log_tail = tail_lines(&log_raw, 200);
 
     let report = format!(
-        "{webview_version}\n登录窗口存在: {exists}\n登录窗口可见: {visible}\n日志文件: {}\n\n===== 最近日志(最多200行) =====\n{}",
+        "登录窗口存在: {exists}\n日志文件: {}\n\n===== 最近日志(最多200行) =====\n{}",
         log_path.display(),
         if log_tail.trim().is_empty() {
             "（暂无日志）".to_string()

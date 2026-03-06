@@ -371,7 +371,13 @@ function App() {
     setCookieDiagLoading(true);
     setError("");
     try {
-      const text = await invoke<string>("get_jushuitan_login_diagnostics");
+      const timeoutMs = 8000;
+      const text = await Promise.race<string>([
+        invoke<string>("get_jushuitan_login_diagnostics"),
+        new Promise<string>((_, reject) =>
+          window.setTimeout(() => reject(new Error(`读取诊断日志超时（>${timeoutMs / 1000}s）`)), timeoutMs),
+        ),
+      ]);
       setCookieDiagnostics(text);
     } catch (err) {
       setError(String(err));
