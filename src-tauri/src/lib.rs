@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
@@ -147,6 +148,40 @@ fn settings_path(app: &AppHandle) -> Result<PathBuf> {
         .context("无法获取应用配置目录")?;
     fs::create_dir_all(&dir).context("创建配置目录失败")?;
     Ok(dir.join("settings.json"))
+}
+
+fn login_log_path(app: &AppHandle) -> Result<PathBuf> {
+    let dir = app.path().app_log_dir().context("无法获取日志目录")?;
+    fs::create_dir_all(&dir).context("创建日志目录失败")?;
+    Ok(dir.join("jst-login.log"))
+}
+
+fn append_login_log(app: &AppHandle, message: &str) {
+    let path = match login_log_path(app) {
+        Ok(path) => path,
+        Err(_) => return,
+    };
+    let line = format!(
+        "[{}] {}\n",
+        Local::now().format("%Y-%m-%d %H:%M:%S"),
+        message
+    );
+    if let Ok(mut file) = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+fn tail_lines(content: &str, max_lines: usize) -> String {
+    let lines = content.lines().collect::<Vec<&str>>();
+    if lines.len() <= max_lines {
+        return content.to_string();
+    }
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..].join("\n")
 }
 
 fn normalize_text(input: &str) -> String {
@@ -910,8 +945,10 @@ fn open_jushuitan_login_window(app: AppHandle, login_url: Option<String>) -> Res
 
     let parsed = Url::parse(&url).map_err(|e| format!("登录 URL 格式错误: {}", e))?;
     let label = "jst-login";
+    append_login_log(&app, &format!("请求打开登录窗口，URL={}", parsed));
 
     if let Some(window) = app.get_webview_window(label) {
+        append_login_log(&app, "登录窗口已存在，尝试复用并跳转");
         window
             .navigate(parsed)
             .map_err(|e| format!("跳转登录页失败: {}", e))?;
@@ -919,14 +956,32 @@ fn open_jushuitan_login_window(app: AppHandle, login_url: Option<String>) -> Res
         window
             .set_focus()
             .map_err(|e| format!("聚焦登录窗口失败: {}", e))?;
+        append_login_log(&app, "复用窗口成功");
         return Ok(());
     }
+
+    let nav_log_app = app.clone();
+    let load_log_app = app.clone();
 
     #[cfg(target_os = "windows")]
     let builder = WebviewWindowBuilder::new(&app, label, WebviewUrl::External(parsed))
         .title("聚水潭登录")
         .inner_size(1280.0, 860.0)
         .resizable(true)
+        .on_navigation(move |url| {
+            append_login_log(&nav_log_app, &format!("on_navigation: {}", url));
+            true
+        })
+        .on_page_load(move |_, payload| {
+            append_login_log(
+                &load_log_app,
+                &format!(
+                    "on_page_load: event={:?}, url={}",
+                    payload.event(),
+                    payload.url()
+                ),
+            );
+        })
         // 某些站点在 Windows WebView2 上会因为 UA 识别导致白屏，显式伪装为桌面 Chrome。
         .user_agent(
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
@@ -936,17 +991,33 @@ fn open_jushuitan_login_window(app: AppHandle, login_url: Option<String>) -> Res
     let builder = WebviewWindowBuilder::new(&app, label, WebviewUrl::External(parsed))
         .title("聚水潭登录")
         .inner_size(1280.0, 860.0)
-        .resizable(true);
+        .resizable(true)
+        .on_navigation(move |url| {
+            append_login_log(&nav_log_app, &format!("on_navigation: {}", url));
+            true
+        })
+        .on_page_load(move |_, payload| {
+            append_login_log(
+                &load_log_app,
+                &format!(
+                    "on_page_load: event={:?}, url={}",
+                    payload.event(),
+                    payload.url()
+                ),
+            );
+        });
 
     builder
         .build()
         .map_err(|e| format!("创建登录窗口失败: {}", e))?;
+    append_login_log(&app, "创建登录窗口成功");
 
     Ok(())
 }
 
 #[tauri::command]
 fn capture_jushuitan_cookie(app: AppHandle) -> Result<String, String> {
+    append_login_log(&app, "开始提取 Cookie");
     let window = app
         .get_webview_window("jst-login")
         .ok_or_else(|| "未找到登录窗口，请先点击“打开登录窗口”并完成登录".to_string())?;
@@ -962,6 +1033,10 @@ fn capture_jushuitan_cookie(app: AppHandle) -> Result<String, String> {
             .map(|domain| domain.contains("erp321.com"))
             .unwrap_or(false)
     });
+    append_login_log(
+        &app,
+        &format!("窗口 Cookie 初次读取数量（过滤后）={}", all_cookies.len()),
+    );
 
     if all_cookies.is_empty() {
         let urls = [
@@ -984,6 +1059,10 @@ fn capture_jushuitan_cookie(app: AppHandle) -> Result<String, String> {
                 .map(|domain| domain.contains("erp321.com"))
                 .unwrap_or(false)
         });
+        append_login_log(
+            &app,
+            &format!("按域名补充后 Cookie 数量（过滤后）={}", all_cookies.len()),
+        );
     }
 
     if all_cookies.is_empty() {
@@ -1008,8 +1087,61 @@ fn capture_jushuitan_cookie(app: AppHandle) -> Result<String, String> {
 
     let client = build_http_client().map_err(|e| e.to_string())?;
     get_view_state(&client, &cookie_header).map_err(|e| format!("Cookie 提取成功，但校验失败: {}", e))?;
+    append_login_log(&app, "Cookie 提取并校验通过");
 
     Ok(cookie_header)
+}
+
+#[tauri::command]
+fn close_jushuitan_login_window(app: AppHandle) -> Result<(), String> {
+    append_login_log(&app, "收到关闭登录窗口请求");
+    let Some(window) = app.get_webview_window("jst-login") else {
+        append_login_log(&app, "关闭请求结束：未找到登录窗口");
+        return Ok(());
+    };
+    window
+        .destroy()
+        .map_err(|e| format!("强制关闭登录窗口失败: {}", e))?;
+    append_login_log(&app, "登录窗口已强制关闭");
+    Ok(())
+}
+
+#[tauri::command]
+fn get_jushuitan_login_diagnostics(app: AppHandle) -> Result<String, String> {
+    let webview_version = match tauri::webview_version() {
+        Ok(v) => format!("WebView Runtime: {}", v),
+        Err(e) => format!("WebView Runtime: unavailable ({})", e),
+    };
+
+    let (exists, visible) = if let Some(window) = app.get_webview_window("jst-login") {
+        let visible = window.is_visible().unwrap_or(false);
+        (true, visible)
+    } else {
+        (false, false)
+    };
+
+    let log_path = login_log_path(&app).map_err(|e| e.to_string())?;
+    let log_raw = fs::read_to_string(&log_path).unwrap_or_default();
+    let log_tail = tail_lines(&log_raw, 200);
+
+    let report = format!(
+        "{webview_version}\n登录窗口存在: {exists}\n登录窗口可见: {visible}\n日志文件: {}\n\n===== 最近日志(最多200行) =====\n{}",
+        log_path.display(),
+        if log_tail.trim().is_empty() {
+            "（暂无日志）".to_string()
+        } else {
+            log_tail
+        }
+    );
+    Ok(report)
+}
+
+#[tauri::command]
+fn clear_jushuitan_login_diagnostics(app: AppHandle) -> Result<(), String> {
+    let path = login_log_path(&app).map_err(|e| e.to_string())?;
+    fs::write(&path, "").map_err(|e| format!("清空日志失败: {}", e))?;
+    append_login_log(&app, "日志已清空");
+    Ok(())
 }
 
 #[tauri::command]
@@ -1082,7 +1214,10 @@ pub fn run() {
             load_settings,
             save_settings,
             open_jushuitan_login_window,
+            close_jushuitan_login_window,
             capture_jushuitan_cookie,
+            get_jushuitan_login_diagnostics,
+            clear_jushuitan_login_diagnostics,
             validate_jushuitan_cookie,
             test_review_prompt,
             run_rating_task

@@ -130,6 +130,9 @@ function App() {
   const [promptTesting, setPromptTesting] = useState(false);
   const [cookieChecking, setCookieChecking] = useState(false);
   const [cookieExtracting, setCookieExtracting] = useState(false);
+  const [cookieClosingWindow, setCookieClosingWindow] = useState(false);
+  const [cookieDiagLoading, setCookieDiagLoading] = useState(false);
+  const [cookieDiagnostics, setCookieDiagnostics] = useState("");
 
   const [cookieState, setCookieState] = useState<CookieState>("unknown");
   const [cookieStatus, setCookieStatus] = useState("");
@@ -348,6 +351,45 @@ function App() {
       setCookieStatus(`自动提取失败：${String(err)}`);
     } finally {
       setCookieExtracting(false);
+    }
+  };
+
+  const closeLoginWindow = async () => {
+    setCookieClosingWindow(true);
+    setError("");
+    try {
+      await invoke("close_jushuitan_login_window");
+      setCookieStatus("登录窗口已强制关闭");
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setCookieClosingWindow(false);
+    }
+  };
+
+  const loadCookieDiagnostics = async () => {
+    setCookieDiagLoading(true);
+    setError("");
+    try {
+      const text = await invoke<string>("get_jushuitan_login_diagnostics");
+      setCookieDiagnostics(text);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setCookieDiagLoading(false);
+    }
+  };
+
+  const clearCookieDiagnostics = async () => {
+    setCookieDiagLoading(true);
+    setError("");
+    try {
+      await invoke("clear_jushuitan_login_diagnostics");
+      setCookieDiagnostics("（已清空）");
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setCookieDiagLoading(false);
     }
   };
 
@@ -602,9 +644,31 @@ function App() {
                       <Button
                         loading={cookieChecking}
                         onClick={() => validateCookieByValue(settings.jstCookie)}
-                        disabled={!step1Ready || !step2Ready || cookieExtracting || running}
+                        disabled={!step1Ready || !step2Ready || cookieExtracting || cookieClosingWindow || running}
                       >
                         重新校验
+                      </Button>
+                      <Button
+                        danger
+                        loading={cookieClosingWindow}
+                        onClick={closeLoginWindow}
+                        disabled={cookieExtracting || cookieChecking || running}
+                      >
+                        强制关闭登录窗口
+                      </Button>
+                      <Button
+                        loading={cookieDiagLoading}
+                        onClick={loadCookieDiagnostics}
+                        disabled={running}
+                      >
+                        查看诊断日志
+                      </Button>
+                      <Button
+                        loading={cookieDiagLoading}
+                        onClick={clearCookieDiagnostics}
+                        disabled={running}
+                      >
+                        清空诊断日志
                       </Button>
                       {cookieState === "valid" && <Tag color="success">Cookie 可用</Tag>}
                       {cookieState === "invalid" && <Tag color="error">Cookie 无效</Tag>}
@@ -613,6 +677,15 @@ function App() {
 
                     <Form.Item label="当前 Cookie（自动写入）" style={{ marginTop: 12 }}>
                       <Input.TextArea rows={4} value={settings.jstCookie} readOnly />
+                    </Form.Item>
+
+                    <Form.Item label="登录窗口诊断日志（用于排查白屏）">
+                      <Input.TextArea
+                        rows={9}
+                        value={cookieDiagnostics}
+                        readOnly
+                        placeholder="点击“查看诊断日志”后显示 WebView2 版本、窗口状态和最近页面加载日志"
+                      />
                     </Form.Item>
                   </Form>
 
